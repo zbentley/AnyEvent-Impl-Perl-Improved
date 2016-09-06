@@ -18,3 +18,7 @@ nytprof.out
 *.o
 *.bs
 /_eumm/
+
+# OSX garbage
+.DS_Store
+**/.DS_Store
