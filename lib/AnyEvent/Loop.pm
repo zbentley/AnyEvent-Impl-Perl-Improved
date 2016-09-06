@@ -177,10 +177,9 @@ BEGIN {
 
 _update_clock;
 
-# rely on AnyEvent:Base::time to provide time
+# rely on AnyEvent::time to provide time
 sub now       () { $NOW          }
 sub now_update() { _update_clock }
-
 # fds[0] is for read, fds[1] is for write watchers
 # fds[poll][V] is the bitmask for select
 # fds[poll][W][fd] contains a list of i/o watchers
@@ -194,43 +193,55 @@ sub W() { 1 }
 my $need_sort = 1e300; # when to re-sort timer list
 my @timer; # list of [ abs-timeout, Timer::[callback] ]
 my @idle;  # list of idle callbacks
+my @pending_queue; # Queue of pending events
 
 # the pure perl mainloop
 sub one_event {
+   # The clock doesn't need to be updated until we are going to check for events,
+   # but update it unconditionally since users of now() may expect it to increment
+   # between callback executions.
    _update_clock;
 
-   # first sort timers if required (slow)
-   if ($MNOW >= $need_sort) {
-      $need_sort = 1e300;
-      @timer = sort { $a->[0] <=> $b->[0] } @timer;
+   if ( my $event = shift(@pending_queue) ) {
+      $event->[0](@{$event->[1]});
    }
-
-   # handle all pending timers
-   if (@timer && $timer[0][0] <= $MNOW) {
-      do {
+   else {
+      # first sort timers if required (slow)
+      if ( $MNOW >= $need_sort ) {
+         $need_sort = 1e300;
+         @timer = sort { $a->[0] <=> $b->[0] } @timer;
+      }
+      my $wait = 0;
+      my @vec;
+      # enqueue pending timer, if any.
+      while ( @timer && $timer[0][0] <= $MNOW ) {
+         # Implicit: if there were pending timers, IO event check will poll
+         # once and return without blocking.
          my $timer = shift @timer;
-         $timer->[1] && $timer->[1]($timer);
-      } while @timer && $timer[0][0] <= $MNOW;
+         $timer->[1] && push(@pending_queue, [ $timer->[1], [$timer] ]);
+      }
 
-   } else {
-      # poll for I/O events, we do not do this when there
-      # were any pending timers to ensure that one_event returns
-      # quickly when some timers have been handled
-      my ($wait, @vec, $fds)
-         = (@timer && $timer[0][0] < $need_sort ? $timer[0][0] : $need_sort) - $MNOW;
+      # If there are idle listeners or ready timers, don't block waiting for IO events.
+      if ( ! @idle && ! @pending_queue ) {
+         if ( @timer ) {
+            $wait = List::Util::min(
+               List::Util::min($timer[0][0], $need_sort) - $MNOW + ROUNDUP,
+               MAXWAIT,
+            );
+         }
+         else {
+            $wait = MAXWAIT;
+         }
+      }
 
-      $wait = $wait < MAXWAIT ? $wait + ROUNDUP : MAXWAIT;
-      $wait = 0 if @idle;
-
-      $fds = CORE::select
+      my $readyfds = CORE::select(
         $vec[0] = $fds[0][V],
         $vec[1] = $fds[1][V],
         AnyEvent::WIN32 ? $vec[2] = $fds[1][V] : undef,
-        $wait;
+        $wait,
+      );
 
-      _update_clock;
-
-      if ($fds > 0) {
+      if ( $readyfds > 0 ) {
          # buggy microshit windows errornously sets exceptfds instead of writefds
          $vec[1] |= $vec[2] if AnyEvent::WIN32;
 
@@ -244,15 +255,24 @@ sub one_event {
                # and then repeatedly matching a regex against it
                while (/1/g) {
                   # and use the resulting string position as fd
-                  $_ && $_->[2]()
+                  $_ && push(@pending_queue, [ $_->[2], [] ])
                      for @{ $fds->[W][(pos) - 1] || [] };
                }
             }
          }
-      } elsif (AnyEvent::WIN32 && $fds && $! == AnyEvent::Util::WSAEINVAL) {
+      } elsif ( AnyEvent::WIN32 && $readyfds && $! == AnyEvent::Util::WSAEINVAL ) {
          # buggy microshit windoze asks us to route around it
          CORE::select undef, undef, undef, $wait if $wait;
-      } elsif (!@timer || $timer[0][0] > $MNOW && !$fds) {
+      }
+
+      _update_clock if $wait;
+
+      # This is a bit buggy, since all idle callbacks will be run whenever
+      # there's an idle period, as opposed to run-one-then-check-again.
+      # Better would be to only run one here and track iterator position.
+      # Best would be to select(...0), run an idle if nothing ready, else
+      # select(...>0), but that would double the syscall count.
+      if ( ! @pending_queue && ! $readyfds && ( ! @timer || $timer[0][0] > $MNOW ) ) {
          $$$_ && $$$_->() for @idle = grep $$$_, @idle;
       }
    }
@@ -356,4 +376,3 @@ L<AnyEvent>.
 =cut
 
 1
-

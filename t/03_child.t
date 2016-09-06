@@ -19,9 +19,11 @@ EOF
 }
 
 use AnyEvent;
+use Time::HiRes qw( tv_interval gettimeofday );
+
 BEGIN { require AnyEvent::Impl::Perl unless $ENV{PERL_ANYEVENT_MODEL} }
 
-$| = 1; print "1..50\n";
+$| = 1; print "1..51\n";
 
 $AnyEvent::MAX_SIGNAL_LATENCY = 0.2;
 
@@ -89,6 +91,41 @@ EOF
    print "ok ", $it*10+10, "\n";
 }
 
+# Simulated blocking operation. Busy wait so as not to confound test
+# results with with SIGCHLD causing auto-ERESTARTSYS behavior and being
+# sensitive to signal handler wrapping.
+sub busywait ($) {
+   my $t0 = [gettimeofday()];
+   while (tv_interval($t0) < $_[0]) {}
+}
 
+my $block = 0.1;
+my $pid = fork;
+defined $pid or die "unable to fork";
+unless ( $pid ) {
+   $SIG{INT} = sub { busywait($block / 2); exit; };
+   busywait(10);
+   exit;
+}
 
+my $cv = AnyEvent->condvar;
+my $maybestarved = AnyEvent->child(
+    pid => $pid,
+    cb => $cv,
+);
+my $count = 0;
+my $timer = AnyEvent->timer(
+    interval => $block / 2,
+    cb => sub {
+      if ( ++$count >= 10 ) {
+         $cv->send; # Don't wait forever; give up and fail after 10 cb runs.
+      }
+      else {
+         busywait($block);
+      }
+    },
+);
+kill "INT", $pid; # Start the child timer burning down.
+$cv->recv;
 
+print "ok 51\n" if $count < 10;
